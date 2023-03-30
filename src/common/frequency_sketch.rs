@@ -30,9 +30,9 @@ static SEED: [u64; 4] = [
     0xcbf2_9ce4_8422_2325,
 ];
 
-static RESET_MASK: u64 = 0x7777_7777_7777_7777;
+static RESET_MASK: u64 = 0x7FFF_7FFF_7FFF_7FFF;
 
-static ONE_MASK: u64 = 0x1111_1111_1111_1111;
+static ONE_MASK: u64 = 0x0001_0001_0001_0001;
 
 // -------------------------------------------------------------------------------
 // Some of the code and doc comments in this module were ported or copied from
@@ -110,24 +110,24 @@ impl FrequencySketch {
     }
 
     /// Takes the hash value of an element, and returns the estimated number of
-    /// occurrences of the element, up to the maximum (15).
-    pub(crate) fn frequency(&self, hash: u64) -> u8 {
+    /// occurrences of the element, up to the maximum (65535).
+    pub(crate) fn frequency(&self, hash: u64) -> u16 {
         if self.table.is_empty() {
             return 0;
         }
 
-        let start = ((hash & 3) << 2) as u8;
-        let mut frequency = std::u8::MAX;
+        let start = (hash & 3) as u8;
+        let mut frequency = std::u16::MAX;
         for i in 0..4 {
             let index = self.index_of(hash, i);
-            let count = (self.table[index] >> ((start + i) << 2) & 0xF) as u8;
+            let count = (self.table[index] >> ((start + i) % 4 << 4) & 0xFFFF) as u16;
             frequency = frequency.min(count);
         }
         frequency
     }
 
     /// Take a hash value of an element and increments the popularity of the
-    /// element if it does not exceed the maximum (15). The popularity of all
+    /// element if it does not exceed the maximum (65535). The popularity of all
     /// elements will be periodically down sampled when the observed events
     /// exceeds a threshold. This process provides a frequency aging to allow
     /// expired long term entries to fade away.
@@ -136,11 +136,11 @@ impl FrequencySketch {
             return;
         }
 
-        let start = ((hash & 3) << 2) as u8;
+        let start = (hash & 3) as u8;
         let mut added = false;
         for i in 0..4 {
             let index = self.index_of(hash, i);
-            added |= self.increment_at(index, start + i);
+            added |= self.increment_at(index, (start + i) % 4);
         }
 
         if added {
@@ -151,12 +151,12 @@ impl FrequencySketch {
         }
     }
 
-    /// Takes a table index (each entry has 16 counters) and counter index, and
+    /// Takes a table index (each entry has 4 counters) and counter index, and
     /// increments the counter by 1 if it is not already at the maximum value
-    /// (15). Returns `true` if incremented.
+    /// (65535). Returns `true` if incremented.
     fn increment_at(&mut self, table_index: usize, counter_index: u8) -> bool {
-        let offset = (counter_index as usize) << 2;
-        let mask = 0xF_u64 << offset;
+        let offset = (counter_index as usize) << 4;
+        let mask = 0xFFFF_u64 << offset;
         if self.table[table_index] & mask != mask {
             self.table[table_index] += 1u64 << offset;
             true
@@ -229,13 +229,13 @@ mod tests {
     #[test]
     fn increment_max() {
         let mut sketch = FrequencySketch::default();
-        sketch.ensure_capacity(512);
+        sketch.ensure_capacity(65535);
         let hasher = hasher();
         let item_hash = hasher(*ITEM);
-        for _ in 0..20 {
+        for _ in 0..65540 {
             sketch.increment(item_hash);
         }
-        assert_eq!(sketch.frequency(item_hash), 15);
+        assert_eq!(sketch.frequency(item_hash), 65535);
     }
 
     // This test was ported from Caffeine.
