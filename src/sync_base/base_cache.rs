@@ -4,6 +4,8 @@ use super::{
     key_lock::{KeyLock, KeyLockMap},
     PredicateId,
 };
+use rand::seq::IteratorRandom;
+use std::collections::HashSet;
 
 use crate::{
     common::{
@@ -20,7 +22,7 @@ use crate::{
             AccessTime, KeyDate, KeyHash, KeyHashDate, KvEntry, ReadOp, ValueEntry, Weigher,
             WriteOp,
         },
-        deque::{DeqNode, Deque},
+        deque::Deque,
         frequency_sketch::FrequencySketch,
         time::{CheckedTimeOps, Clock, Instant},
         CacheRegion,
@@ -735,7 +737,7 @@ impl EntrySizeAndFrequency {
         }
     }
 
-    fn add_policy_weight(&mut self, weight: u32) {
+    fn _add_policy_weight(&mut self, weight: u32) {
         self.policy_weight += weight as u64;
     }
 
@@ -744,16 +746,12 @@ impl EntrySizeAndFrequency {
     }
 }
 
-// Access-Order Queue Node
-type AoqNode<K> = NonNull<DeqNode<KeyHashDate<K>>>;
-
 enum AdmissionResult<K> {
     Admitted {
-        victim_nodes: SmallVec<[AoqNode<K>; 8]>,
-        skipped_nodes: SmallVec<[AoqNode<K>; 4]>,
+        victim_entries: SmallVec<[(Option<Arc<K>>, u64); 8]>,
     },
     Rejected {
-        skipped_nodes: SmallVec<[AoqNode<K>; 4]>,
+        victim_entries: SmallVec<[(Option<Arc<K>>, u64); 8]>,
     },
 }
 
@@ -1225,6 +1223,12 @@ where
             .unwrap_or(true)
     }
 
+    fn policy_weights_left(&self, counters: &EvictionCounters) -> u64 {
+        self.max_capacity
+            .map(|limit| limit.saturating_sub(counters.weighted_size))
+            .unwrap_or_default()
+    }
+
     fn weights_to_evict(&self, counters: &EvictionCounters) -> u64 {
         self.max_capacity
             .map(|limit| counters.weighted_size.saturating_sub(limit))
@@ -1379,51 +1383,67 @@ where
             }
         }
 
-        let skipped_nodes;
         let mut candidate = EntrySizeAndFrequency::new(new_weight);
         candidate.add_frequency(freq, kh.hash);
 
         // Try to admit the candidate.
-        match Self::admit(&candidate, &self.cache, deqs, freq) {
-            AdmissionResult::Admitted {
-                victim_nodes,
-                skipped_nodes: mut skipped,
-            } => {
+        match Self::admit(
+            &candidate,
+            &self.cache,
+            freq,
+            self.policy_weights_left(&eviction_state.counters),
+        ) {
+            AdmissionResult::Admitted { victim_entries } => {
                 // Try to remove the victims from the cache (hash map).
-                for victim in victim_nodes {
-                    let element = unsafe { &victim.as_ref().element };
+                for (key, hash) in victim_entries {
+                    if let Some(key) = key {
+                        // Lock the key for removal if blocking removal notification is enabled.
+                        let kl = self.maybe_key_lock(&key);
+                        let _klg = &kl.as_ref().map(|kl| kl.lock());
 
-                    // Lock the key for removal if blocking removal notification is enabled.
-                    let kl = self.maybe_key_lock(element.key());
-                    let _klg = &kl.as_ref().map(|kl| kl.lock());
-
-                    if let Some((vic_key, vic_entry)) = self
-                        .cache
-                        .remove_entry(element.hash(), |k| k == element.key())
-                    {
-                        if eviction_state.is_notifier_enabled() {
-                            eviction_state.add_removed_entry(
-                                vic_key,
-                                &vic_entry,
-                                RemovalCause::Size,
-                            );
+                        if let Some((vic_key, vic_entry)) =
+                            self.cache.remove_entry(hash, |k| k == &key)
+                        {
+                            if eviction_state.is_notifier_enabled() {
+                                eviction_state.add_removed_entry(
+                                    vic_key,
+                                    &vic_entry,
+                                    RemovalCause::Size,
+                                );
+                            }
+                            // And then remove the victim from the deques.
+                            Self::handle_remove(deqs, vic_entry, &mut eviction_state.counters);
                         }
-                        // And then remove the victim from the deques.
-                        Self::handle_remove(deqs, vic_entry, &mut eviction_state.counters);
-                    } else {
-                        // Could not remove the victim from the cache. Skip this
-                        // victim node as its ValueEntry might have been
-                        // invalidated. Add it to the skipped nodes.
-                        skipped.push(victim);
                     }
                 }
-                skipped_nodes = skipped;
-
                 // Add the candidate to the deques.
                 self.handle_admit(kh, &entry, new_weight, deqs, &mut eviction_state.counters);
             }
-            AdmissionResult::Rejected { skipped_nodes: s } => {
-                skipped_nodes = s;
+            AdmissionResult::Rejected { victim_entries } => {
+                // Try to remove the victims from the cache (hash map).
+                {
+                    for (key, hash) in victim_entries {
+                        if let Some(key) = key {
+                            // Lock the key for removal if blocking removal notification is enabled.
+                            let kl = self.maybe_key_lock(&key);
+                            let _klg = &kl.as_ref().map(|kl| kl.lock());
+
+                            if let Some((vic_key, vic_entry)) =
+                                self.cache.remove_entry(hash, |k| k == &key)
+                            {
+                                if eviction_state.is_notifier_enabled() {
+                                    eviction_state.add_removed_entry(
+                                        vic_key,
+                                        &vic_entry,
+                                        RemovalCause::Size,
+                                    );
+                                }
+                                // And then remove the victim from the deques.
+                                Self::handle_remove(deqs, vic_entry, &mut eviction_state.counters);
+                            }
+                        }
+                    }
+                }
 
                 // Lock the key for removal if blocking removal notification is enabled.
                 let kl = self.maybe_key_lock(&kh.key);
@@ -1440,9 +1460,9 @@ where
 
         // Move the skipped nodes to the back of the deque. We do not unlink (drop)
         // them because ValueEntries in the write op queue should be pointing them.
-        for node in skipped_nodes {
-            unsafe { deqs.probation.move_to_back(node) };
-        }
+        // for node in skipped_nodes {
+        //     unsafe { deqs.probation.move_to_back(node) };
+        // }
     }
 
     /// Performs size-aware admission explained in the paper:
@@ -1466,62 +1486,73 @@ where
     fn admit(
         candidate: &EntrySizeAndFrequency,
         cache: &CacheStore<K, V, S>,
-        deqs: &Deques<K>,
         freq: &FrequencySketch,
+        mut policy_weights: u64,
     ) -> AdmissionResult<K> {
-        const MAX_CONSECUTIVE_RETRIES: usize = 5;
-        let mut retries = 0;
+        const LFU_SAMPLE: usize = 5;
 
-        let mut victims = EntrySizeAndFrequency::default();
-        let mut victim_nodes = SmallVec::default();
-        let mut skipped_nodes = SmallVec::default();
+        let mut victim_entries = SmallVec::default();
 
-        // Get first potential victim at the LRU position.
-        let mut next_victim = deqs.probation.peek_front();
-
-        // Aggregate potential victims.
-        while victims.policy_weight < candidate.policy_weight {
-            if candidate.freq < victims.freq {
-                break;
-            }
-            if let Some(victim) = next_victim.take() {
-                next_victim = victim.next_node();
-                let vic_elem = &victim.element;
-
-                if let Some(vic_entry) = cache.get(vic_elem.hash(), |k| k == vic_elem.key()) {
-                    victims.add_policy_weight(vic_entry.policy_weight());
-                    victims.add_frequency(freq, vic_elem.hash());
-                    victim_nodes.push(NonNull::from(victim));
-                    retries = 0;
-                } else {
-                    // Could not get the victim from the cache (hash map). Skip this node
-                    // as its ValueEntry might have been invalidated.
-                    skipped_nodes.push(NonNull::from(victim));
-
-                    retries += 1;
-                    if retries > MAX_CONSECUTIVE_RETRIES {
-                        break;
+        let mut rng = rand::thread_rng();
+        let mut samples = Vec::with_capacity(LFU_SAMPLE);
+        let mut visited = HashSet::with_capacity(16);
+        while policy_weights < candidate.policy_weight {
+            'Out: for i in (0..cache.actual_num_segments())
+                .choose_multiple(&mut rng, cache.actual_num_segments())
+            {
+                let keys = cache.keys(i, Arc::clone).unwrap();
+                if keys.is_empty() {
+                    continue;
+                }
+                if samples.len() < LFU_SAMPLE {
+                    for k in keys
+                        .iter()
+                        .choose_multiple(&mut rng, keys.len().min(LFU_SAMPLE))
+                    {
+                        if visited.insert(k.clone()) {
+                            samples.push(k.clone());
+                            if samples.len() == LFU_SAMPLE {
+                                break 'Out;
+                            }
+                        }
                     }
                 }
-            } else {
-                // No more potential victims.
-                break;
             }
+            let (mut min_freq, mut min_policy_weight, mut min_key, mut min_hash, mut min_id) =
+                (u32::MAX, 0, None, 0, 0);
+
+            for (id, key) in samples.iter().enumerate() {
+                let hash = cache.hash(key);
+                let entry = cache
+                    .get_key_value_and_then(hash, |k| k == key, |_, entry| Some(entry.clone()))
+                    .unwrap();
+                if entry.is_admitted() {
+                    let freq = freq.frequency(hash) as u32;
+                    if freq < min_freq {
+                        min_freq = freq;
+                        min_policy_weight = entry.policy_weight();
+                        min_key = Some(key);
+                        min_hash = hash;
+                        min_id = id;
+                    }
+                }
+            }
+
+            if min_freq > candidate.freq {
+                return AdmissionResult::Rejected { victim_entries };
+            }
+            victim_entries.push((min_key.cloned(), min_hash));
+            let new_len = samples.len() - 1;
+            samples[min_id] = samples[new_len].clone();
+            samples.drain(new_len..);
+            policy_weights += min_policy_weight as u64;
         }
+        AdmissionResult::Admitted { victim_entries }
 
         // Admit or reject the candidate.
 
         // TODO: Implement some randomness to mitigate hash DoS attack.
         // See Caffeine's implementation.
-
-        if victims.policy_weight >= candidate.policy_weight && candidate.freq > victims.freq {
-            AdmissionResult::Admitted {
-                victim_nodes,
-                skipped_nodes,
-            }
-        } else {
-            AdmissionResult::Rejected { skipped_nodes }
-        }
     }
 
     fn handle_admit(

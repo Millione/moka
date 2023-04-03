@@ -2075,9 +2075,10 @@ mod tests {
             assert_with_mode!(cache.contains_key(&"a"), delivery_mode);
             assert_eq_with_mode!(cache.get(&"a"), Some(alice), delivery_mode);
             assert_eq_with_mode!(cache.get(&"b"), Some(bob), delivery_mode);
+            assert_eq_with_mode!(cache.get(&"b"), Some(bob), delivery_mode);
             assert_with_mode!(cache.contains_key(&"b"), delivery_mode);
             cache.sync();
-            // order and counts: c -> 1, a -> 2, b -> 2
+            // order and counts: c -> 1, a -> 2, b -> 3
 
             // To enter "d" (weight: 15), it needs to evict "c" (w: 5) and "a" (w: 10).
             // "d" must have higher count than 3, which is the aggregated count
@@ -2089,32 +2090,22 @@ mod tests {
             assert_with_mode!(!cache.contains_key(&"d"), delivery_mode);
 
             cache.insert("d", david);
+            expected.push((Arc::new("c"), cindy, RemovalCause::Size));
             expected.push((Arc::new("d"), david, RemovalCause::Size));
             cache.sync();
+            assert_with_mode!(!cache.contains_key(&"c"), delivery_mode);
+            assert_eq_with_mode!(cache.get(&"c"), None, delivery_mode);
             assert_with_mode!(!cache.contains_key(&"d"), delivery_mode);
             assert_eq_with_mode!(cache.get(&"d"), None, delivery_mode); //   d -> 2
 
-            cache.insert("d", david);
-            expected.push((Arc::new("d"), david, RemovalCause::Size));
-            cache.sync();
-            assert_eq_with_mode!(cache.get(&"d"), None, delivery_mode); //   d -> 3
-            assert_with_mode!(!cache.contains_key(&"d"), delivery_mode);
-
-            cache.insert("d", david);
-            expected.push((Arc::new("d"), david, RemovalCause::Size));
-            cache.sync();
-            assert_with_mode!(!cache.contains_key(&"d"), delivery_mode);
-            assert_eq_with_mode!(cache.get(&"d"), None, delivery_mode); //   d -> 4
-
             // Finally "d" should be admitted by evicting "c" and "a".
-            cache.insert("d", dennis);
-            expected.push((Arc::new("c"), cindy, RemovalCause::Size));
+            cache.insert("d", david);
             expected.push((Arc::new("a"), alice, RemovalCause::Size));
             cache.sync();
             assert_eq_with_mode!(cache.get(&"a"), None, delivery_mode);
             assert_eq_with_mode!(cache.get(&"b"), Some(bob), delivery_mode);
             assert_eq_with_mode!(cache.get(&"c"), None, delivery_mode);
-            assert_eq_with_mode!(cache.get(&"d"), Some(dennis), delivery_mode);
+            assert_eq_with_mode!(cache.get(&"d"), Some(david), delivery_mode);
             assert_with_mode!(!cache.contains_key(&"a"), delivery_mode);
             assert_with_mode!(cache.contains_key(&"b"), delivery_mode);
             assert_with_mode!(!cache.contains_key(&"c"), delivery_mode);
@@ -2123,7 +2114,7 @@ mod tests {
             // Update "b" with "bill" (w: 15 -> 20). This should evict "d" (w: 15).
             cache.insert("b", bill);
             expected.push((Arc::new("b"), bob, RemovalCause::Replaced));
-            expected.push((Arc::new("d"), dennis, RemovalCause::Size));
+            expected.push((Arc::new("d"), david, RemovalCause::Size));
             cache.sync();
             assert_eq_with_mode!(cache.get(&"b"), Some(bill), delivery_mode);
             assert_eq_with_mode!(cache.get(&"d"), None, delivery_mode);
